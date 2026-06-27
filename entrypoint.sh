@@ -618,10 +618,15 @@ join_mod_paths() {
     local path
 
     for path in "${paths[@]}"; do
-        joined+="${path};"
+        if [[ -n "$joined" ]]; then
+            # Linux-Arma benötigt den Backslash als Teil des Arguments.
+            joined+='\;'
+        fi
+
+        joined+="$path"
     done
 
-    printf '%s' "${joined%;}"
+    printf '%s' "$joined"
 }
 
 parse_startup_parameters() {
