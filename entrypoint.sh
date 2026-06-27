@@ -361,25 +361,29 @@ EOF
 normalise_mod_filenames() {
     local mod_dir="$1"
     local source_file
+    local source_dir
+    local source_name
+    local target_name
     local target_file
     local renamed_count=0
 
     is_enabled "$LOWERCASE_WORKSHOP_FILES" || return 0
 
-    # Arma 3 unter Linux erwartet insbesondere PBO- und BISIGN-Dateien in
-    # Kleinbuchstaben. Workshop-Mods enthalten teilweise Windows-Dateinamen
-    # mit Großbuchstaben, die auf Linux sonst nicht auflösbar sind.
+    # Nur den Dateinamen selbst klein schreiben.
+    # Verzeichnisnamen wie /home/container/Steam bleiben unverändert.
     while IFS= read -r -d '' source_file; do
-        target_file="${source_file,,}"
+        source_dir="$(dirname -- "$source_file")"
+        source_name="$(basename -- "$source_file")"
+        target_name="${source_name,,}"
+        target_file="${source_dir}/${target_name}"
 
-        [[ "$source_file" == "$target_file" ]] && continue
+        [[ "$source_name" == "$target_name" ]] && continue
 
-        # SteamCMD kann nach Updates sowohl die alte klein geschriebene als
-        # auch die neue Originaldatei mit Großbuchstaben hinterlassen.
-        # Die aktuelle Workshop-Datei mit Großbuchstaben überschreibt dann
-        # bewusst die ältere klein geschriebene Variante.
+        # Falls nach einem vorherigen Update bereits eine alte lowercase-Datei
+        # existiert, wird sie durch die aktuelle Workshop-Datei ersetzt.
         if [[ -e "$target_file" ]]; then
-            rm -f -- "$target_file"
+            rm -f -- "$target_file" \
+                || die "Could not remove existing lowercase file '${target_file}'."
         fi
 
         mv -- "$source_file" "$target_file" \
