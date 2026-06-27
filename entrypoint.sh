@@ -1,37 +1,41 @@
 #!/usr/bin/env bash
-# Custom wrapper for ghcr.io/ptero-eggs/games:arma3
+# Custom Arma 3 / Pterodactyl entrypoint.
 #
-# Optional Pterodactyl variables:
+# The script deliberately starts Arma directly. It does not delegate to the
+# upstream entrypoint, because the upstream startup command quoting is the
+# remaining source of the mod-loading problem in this deployment.
+#
+# Optional custom variables:
 #   STEAM_WORKSHOP_COLLECTION_URL
 #   STEAM_WORKSHOP_SERVERMODS_COLLECTION_URL
+#   STEAMCMD_BATCH_SIZE            (default 50, hard maximum 50)
+#   WORKSHOP_VALIDATE              (0 default; set 1 only for a full validate)
 #
-# Behaviour:
-#   - Resolves Steam Workshop collections through Steam's collection API.
-#   - Adds normal collection items to MODIFICATIONS.
-#   - Adds server-only collection items to SERVERMODS.
-#   - Downloads Workshop items with SteamCMD in batches of at most 50 items.
-#   - Exposes every Workshop item at /home/container/@<id>.
-#   - Copies .bikey files to /home/container/keys.
-#   - Converts known mod folders to absolute paths before invoking the
-#     original Arma 3 entrypoint.
+# Existing egg variables used:
+#   STEAM_USER, STEAM_PASS, SERVER_PORT, SERVER_BINARY, UPDATE_SERVER,
+#   DISABLE_MOD_UPDATES, STEAMCMD_ATTEMPTS, STEAMCMD_EXTRA_FLAGS,
+#   VALIDATE_SERVER, MODIFICATIONS, SERVERMODS, OPTIONALMODS, STARTUP_PARAMS.
 
 set -Eeuo pipefail
 
-readonly SERVER_ROOT="${SERVER_ROOT:-/home/container}"
-readonly WORKSHOP_APP_ID="${WORKSHOP_APP_ID:-107410}"
-readonly STEAM_COLLECTION_API="${STEAM_COLLECTION_API:-https://api.steampowered.com/ISteamRemoteStorage/GetCollectionDetails/v1/}"
+SERVER_ROOT="${SERVER_ROOT:-/home/container}"
+SERVER_BINARY="${SERVER_BINARY:-arma3server_x64}"
+SERVER_PORT="${SERVER_PORT:-2302}"
+SERVER_CONFIG="${SERVER_CONFIG:-server.cfg}"
+BASIC_CONFIG="${BASIC_CONFIG:-basic.cfg}"
 
-readonly MAX_COLLECTION_DEPTH="${MAX_COLLECTION_DEPTH:-8}"
-readonly MAX_COLLECTION_ITEMS="${MAX_COLLECTION_ITEMS:-500}"
+STEAMCMD_APPID="${STEAMCMD_APPID:-233780}"
+WORKSHOP_APP_ID="${WORKSHOP_APP_ID:-107410}"
+STEAM_COLLECTION_API="${STEAM_COLLECTION_API:-https://api.steampowered.com/ISteamRemoteStorage/GetCollectionDetails/v1/}"
 
-readonly MAX_STEAMCMD_BATCH_SIZE=50
-readonly STEAMCMD_ATTEMPTS="${STEAMCMD_ATTEMPTS:-5}"
-readonly STEAMCMD_RETRY_DELAY="${STEAMCMD_RETRY_DELAY:-5}"
+MAX_COLLECTION_DEPTH="${MAX_COLLECTION_DEPTH:-8}"
+MAX_COLLECTION_ITEMS="${MAX_COLLECTION_ITEMS:-500}"
+MAX_STEAMCMD_BATCH_SIZE=50
 
-readonly UPSTREAM_ENTRYPOINT="${UPSTREAM_ENTRYPOINT:-/entrypoint-upstream.sh}"
-
-# Kann zur Fehlersuche kleiner gesetzt werden, wird aber nie höher als 50.
+STEAMCMD_ATTEMPTS="${STEAMCMD_ATTEMPTS:-3}"
+STEAMCMD_RETRY_DELAY="${STEAMCMD_RETRY_DELAY:-5}"
 STEAMCMD_BATCH_SIZE="${STEAMCMD_BATCH_SIZE:-50}"
+WORKSHOP_VALIDATE="${WORKSHOP_VALIDATE:-0}"
 
 log() {
     printf '[COLLECTION] %s\n' "$*" >&2
@@ -46,7 +50,34 @@ die() {
     exit 1
 }
 
+is_enabled() {
+    case "${1:-0}" in
+        1|true|TRUE|yes|YES|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+trim() {
+    local value="$1"
+
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+
+    printf '%s' "$value"
+}
+
 validate_runtime_settings() {
+    case "$SERVER_BINARY" in
+        arma3server|arma3server_x64|arma3serverprofiling|arma3serverprofiling_x64)
+            ;;
+        *)
+            die "SERVER_BINARY '${SERVER_BINARY}' is not an allowed Arma 3 server binary."
+            ;;
+    esac
+
+    [[ "$SERVER_PORT" =~ ^[0-9]{1,5}$ ]] \
+        || die 'SERVER_PORT must be a valid numeric port.'
+
     [[ "$STEAMCMD_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] \
         || die 'STEAMCMD_ATTEMPTS must be a positive integer.'
 
@@ -56,33 +87,55 @@ validate_runtime_settings() {
     [[ "$STEAMCMD_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] \
         || die 'STEAMCMD_BATCH_SIZE must be a positive integer.'
 
+    [[ "$MAX_COLLECTION_DEPTH" =~ ^[1-9][0-9]*$ ]] \
+        || die 'MAX_COLLECTION_DEPTH must be a positive integer.'
+
+    [[ "$MAX_COLLECTION_ITEMS" =~ ^[1-9][0-9]*$ ]] \
+        || die 'MAX_COLLECTION_ITEMS must be a positive integer.'
+
     if (( STEAMCMD_BATCH_SIZE > MAX_STEAMCMD_BATCH_SIZE )); then
         warn "STEAMCMD_BATCH_SIZE=${STEAMCMD_BATCH_SIZE} exceeds the hard limit of ${MAX_STEAMCMD_BATCH_SIZE}; using ${MAX_STEAMCMD_BATCH_SIZE}."
         STEAMCMD_BATCH_SIZE="$MAX_STEAMCMD_BATCH_SIZE"
     fi
 }
 
-trim_all_whitespace() {
-    # Steam-URLs und Workshop-IDs enthalten keine Leerzeichen. Das behandelt
-    # auch Pterodactyl-Variablen nur mit Leerzeichen als nicht gesetzt.
-    printf '%s' "$1" | tr -d '[:space:]'
+require_steam_credentials() {
+    [[ -n "${STEAM_USER:-}" && -n "${STEAM_PASS:-}" ]] \
+        || die 'STEAM_USER and STEAM_PASS must be configured for SteamCMD operations.'
+}
+
+steamcmd_binary() {
+    local candidate
+
+    for candidate in \
+        "${STEAMCMD_BIN:-}" \
+        "${SERVER_ROOT}/steamcmd/steamcmd.sh" \
+        "${SERVER_ROOT}/Steam/steamcmd.sh"; do
+
+        if [[ -n "$candidate" && -x "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    die "SteamCMD not found. Expected ${SERVER_ROOT}/steamcmd/steamcmd.sh."
 }
 
 extract_collection_id() {
     local value
-    value="$(trim_all_whitespace "$1")"
+    value="$(trim "$1")"
 
     if [[ "$value" =~ ^[0-9]{5,20}$ ]]; then
         printf '%s\n' "$value"
         return 0
     fi
 
-    if [[ "$value" =~ [\?\&]id=([0-9]{5,20})([\&\#]|$) ]]; then
-        printf '%s\n' "${BASH_REMATCH[1]}"
+    if [[ "$value" =~ (^|[\?\&])id=([0-9]{5,20})($|[\&#]) ]]; then
+        printf '%s\n' "${BASH_REMATCH[2]}"
         return 0
     fi
 
-    die 'Collection value must be a numeric Steam Workshop collection ID or a URL containing ?id=<numeric-id>.'
+    die 'A collection value must be a numeric Steam Workshop collection ID or a URL containing ?id=<numeric-id>.'
 }
 
 fetch_collection_json() {
@@ -105,7 +158,7 @@ fetch_collection_json() {
             --data-urlencode 'collectioncount=1' \
             --data-urlencode "publishedfileids[0]=${collection_id}" \
             "$STEAM_COLLECTION_API"
-    )" || die "Could not fetch Steam Workshop collection ${collection_id}. Ensure it is public and Steam's API is reachable."
+    )" || die "Could not fetch Steam Workshop collection ${collection_id}. Ensure the collection is public and Steam's API is reachable."
 
     jq -e \
         '.response.collectiondetails | type == "array" and length == 1' \
@@ -142,7 +195,7 @@ resolve_collection_tree() {
     while IFS=$'\t' read -r child_type child_id; do
         [[ "$child_id" =~ ^[0-9]{5,20}$ ]] || continue
 
-        # Steam filetype 2 identifiziert eine verschachtelte Collection.
+        # Steam filetype 2 denotes a nested Steam Workshop collection.
         if [[ "$child_type" == '2' ]]; then
             log "Resolving nested Steam Workshop collection: ${child_id}"
             resolve_collection_tree "$child_id" "$((depth + 1))"
@@ -193,12 +246,12 @@ append_workshop_ids_to_variable() {
     local -A seen_entries=()
     local entry
     local id
-    local joined=''
+    local result=''
 
     IFS=';' read -r -a entries <<<"${current_value%;}"
 
     for entry in "${entries[@]}"; do
-        entry="$(trim_all_whitespace "$entry")"
+        entry="$(trim "$entry")"
         [[ -n "$entry" ]] || continue
 
         if [[ "$entry" =~ ^@([0-9]{5,20})$ ]]; then
@@ -206,9 +259,8 @@ append_workshop_ids_to_variable() {
         fi
 
         [[ -z "${seen_entries[$entry]:-}" ]] || continue
-
         seen_entries["$entry"]=1
-        joined+="${entry};"
+        result+="${entry};"
     done
 
     for id in "$@"; do
@@ -217,12 +269,11 @@ append_workshop_ids_to_variable() {
         entry="@${id}"
 
         [[ -z "${seen_entries[$entry]:-}" ]] || continue
-
         seen_entries["$entry"]=1
-        joined+="${entry};"
+        result+="${entry};"
     done
 
-    printf -v "$variable_name" '%s' "$joined"
+    printf -v "$variable_name" '%s' "$result"
     export "$variable_name"
 }
 
@@ -235,29 +286,12 @@ collect_workshop_ids_from_variable() {
     IFS=';' read -r -a entries <<<"${current_value%;}"
 
     for entry in "${entries[@]}"; do
-        entry="$(trim_all_whitespace "$entry")"
+        entry="$(trim "$entry")"
 
         if [[ "$entry" =~ ^@([0-9]{5,20})$ ]]; then
             printf '%s\n' "${BASH_REMATCH[1]}"
         fi
     done
-}
-
-steamcmd_binary() {
-    local candidate
-
-    for candidate in \
-        "${STEAMCMD_BIN:-}" \
-        "${SERVER_ROOT}/steamcmd/steamcmd.sh" \
-        "${SERVER_ROOT}/Steam/steamcmd.sh"; do
-
-        if [[ -n "$candidate" && -x "$candidate" ]]; then
-            printf '%s\n' "$candidate"
-            return 0
-        fi
-    done
-
-    die "SteamCMD not found. Expected ${SERVER_ROOT}/steamcmd/steamcmd.sh."
 }
 
 find_workshop_content_dir() {
@@ -307,18 +341,33 @@ copy_bikeys() {
     )
 }
 
+ensure_workshop_meta() {
+    local item_id="$1"
+    local mod_dir="$2"
+    local meta_file="${mod_dir}/meta.cpp"
+
+    if [[ -f "$meta_file" ]] \
+        && grep -Eq "^[[:space:]]*publishedid[[:space:]]*=[[:space:]]*${item_id}[[:space:]]*;" "$meta_file"; then
+        return 0
+    fi
+
+    cat > "$meta_file" <<EOF
+protocol = 1;
+publishedid = ${item_id};
+EOF
+}
+
 expose_workshop_mod() {
     local item_id="$1"
     local source_dir="$2"
-
     local target_dir="${SERVER_ROOT}/@${item_id}"
-    local resolved_target
     local resolved_source
+    local resolved_target
 
     resolved_source="$(readlink -f "$source_dir")"
 
-    # Bereits vorhandene, echte und gültige Mod-Verzeichnisse beibehalten.
     if [[ -d "$target_dir/addons" && ! -L "$target_dir" ]]; then
+        ensure_workshop_meta "$item_id" "$target_dir"
         copy_bikeys "$target_dir"
         return 0
     fi
@@ -340,28 +389,104 @@ expose_workshop_mod() {
     [[ -d "$target_dir/addons" ]] \
         || die "Workshop item ${item_id} was downloaded, but ${target_dir}/addons is missing."
 
+    ensure_workshop_meta "$item_id" "$target_dir"
     copy_bikeys "$source_dir"
 }
 
-download_and_expose_workshop_item() {
+steamcmd_update_server() {
+    local steamcmd
+    local -a command=()
+    local -a extra_flags=()
+
+    is_enabled "${UPDATE_SERVER:-1}" || {
+        log 'UPDATE_SERVER is disabled; skipping Arma 3 Dedicated Server update.'
+        return 0
+    }
+
+    require_steam_credentials
+    steamcmd="$(steamcmd_binary)"
+
+    read -r -a extra_flags <<<"${STEAMCMD_EXTRA_FLAGS:-}"
+
+    command=(
+        "$steamcmd"
+        +force_install_dir "$SERVER_ROOT"
+        +login "$STEAM_USER" "$STEAM_PASS"
+        +app_update "$STEAMCMD_APPID"
+    )
+
+    if (( ${#extra_flags[@]} > 0 )); then
+        command+=("${extra_flags[@]}")
+    fi
+
+    if is_enabled "${VALIDATE_SERVER:-0}"; then
+        command+=(validate)
+    fi
+
+    command+=(+quit)
+
+    log "Checking for Arma 3 Dedicated Server updates with App ID: ${STEAMCMD_APPID}."
+
+    HOME="$SERVER_ROOT" "${command[@]}" \
+        || die 'Arma 3 Dedicated Server update failed.'
+}
+
+download_workshop_batch() {
+    local steamcmd="$1"
+    shift
+
+    local -a item_ids=("$@")
+    local -a command=()
+    local item_id
+
+    (( ${#item_ids[@]} > 0 )) || return 0
+
+    command=(
+        "$steamcmd"
+        +login "$STEAM_USER" "$STEAM_PASS"
+    )
+
+    for item_id in "${item_ids[@]}"; do
+        command+=(
+            +workshop_download_item
+            "$WORKSHOP_APP_ID"
+            "$item_id"
+        )
+
+        if is_enabled "$WORKSHOP_VALIDATE"; then
+            command+=(validate)
+        fi
+    done
+
+    command+=(+quit)
+
+    HOME="$SERVER_ROOT" "${command[@]}"
+}
+
+download_workshop_item_with_retries() {
     local item_id="$1"
     local steamcmd
     local attempt
     local source_dir
+    local -a command=()
 
+    require_steam_credentials
     steamcmd="$(steamcmd_binary)"
 
-    [[ -n "${STEAM_USER:-}" && -n "${STEAM_PASS:-}" ]] \
-        || die 'STEAM_USER and STEAM_PASS must be configured for Workshop downloads.'
-
     for ((attempt = 1; attempt <= STEAMCMD_ATTEMPTS; attempt++)); do
-        log "Retrying Workshop item ${item_id} individually (attempt ${attempt}/${STEAMCMD_ATTEMPTS})..."
+        log "Retrying Workshop item ${item_id} individually (attempt ${attempt}/${STEAMCMD_ATTEMPTS})."
 
-        if HOME="$SERVER_ROOT" "$steamcmd" \
-            +login "$STEAM_USER" "$STEAM_PASS" \
-            +workshop_download_item "$WORKSHOP_APP_ID" "$item_id" validate \
-            +quit; then
+        command=(
+            "$steamcmd"
+            +login "$STEAM_USER" "$STEAM_PASS"
+            +workshop_download_item "$WORKSHOP_APP_ID" "$item_id"
+        )
 
+        # A retry validates incomplete or corrupt content regardless of the
+        # normal WORKSHOP_VALIDATE setting.
+        command+=(validate +quit)
+
+        if HOME="$SERVER_ROOT" "${command[@]}"; then
             source_dir="$(find_workshop_content_dir "$item_id" || true)"
 
             if [[ -n "$source_dir" && -d "$source_dir/addons" ]]; then
@@ -369,8 +494,6 @@ download_and_expose_workshop_item() {
                 log "Workshop item ${item_id} is ready at @${item_id}."
                 return 0
             fi
-
-            warn "SteamCMD reported success for ${item_id}, but no usable addons directory was found."
         fi
 
         if (( attempt < STEAMCMD_ATTEMPTS )); then
@@ -379,110 +502,197 @@ download_and_expose_workshop_item() {
         fi
     done
 
-    die "Could not download Workshop item ${item_id} after ${STEAMCMD_ATTEMPTS} attempt(s)."
+    die "Could not prepare Workshop item ${item_id} after ${STEAMCMD_ATTEMPTS} attempt(s)."
 }
 
-download_and_expose_workshop_items_batch() {
-    local steamcmd
+prepare_workshop_items() {
+    local -a all_items=("$@")
+    local -a batch=()
+    local -a failed_items=()
     local item_id
     local source_dir
     local start_index=0
-    local total_items="$#"
+    local total_items="${#all_items[@]}"
     local batch_number=0
-
-    local -a all_items=("$@")
-    local -a batch=()
-    local -a command=()
-    local -a failed_items=()
+    local steamcmd
 
     (( total_items > 0 )) || return 0
 
-    steamcmd="$(steamcmd_binary)"
+    if is_enabled "${DISABLE_MOD_UPDATES:-0}"; then
+        log 'DISABLE_MOD_UPDATES is enabled; using only already downloaded Workshop items.'
+    else
+        require_steam_credentials
+        steamcmd="$(steamcmd_binary)"
 
-    [[ -n "${STEAM_USER:-}" && -n "${STEAM_PASS:-}" ]] \
-        || die 'STEAM_USER and STEAM_PASS must be configured for Workshop downloads.'
+        while (( start_index < total_items )); do
+            batch=("${all_items[@]:start_index:STEAMCMD_BATCH_SIZE}")
+            batch_number=$((batch_number + 1))
 
-    while (( start_index < total_items )); do
-        batch=("${all_items[@]:start_index:STEAMCMD_BATCH_SIZE}")
-        batch_number=$((batch_number + 1))
+            log "Downloading ${#batch[@]} Workshop item(s) in SteamCMD batch ${batch_number} (maximum ${MAX_STEAMCMD_BATCH_SIZE} per session)."
 
-        log "Downloading ${#batch[@]} Workshop item(s) in SteamCMD batch ${batch_number} (maximum ${MAX_STEAMCMD_BATCH_SIZE} per session)..."
+            if ! download_workshop_batch "$steamcmd" "${batch[@]}"; then
+                warn "SteamCMD reported at least one failed operation in batch ${batch_number}; checking individual item states."
+            fi
 
-        command=(
-            "$steamcmd"
-            +login "$STEAM_USER" "$STEAM_PASS"
-        )
-
-        for item_id in "${batch[@]}"; do
-            command+=(
-                +workshop_download_item
-                "$WORKSHOP_APP_ID"
-                "$item_id"
-                validate
-            )
+            start_index=$((start_index + ${#batch[@]}))
         done
+    fi
 
-        command+=(+quit)
+    for item_id in "${all_items[@]}"; do
+        source_dir="$(find_workshop_content_dir "$item_id" || true)"
 
-        # SteamCMD liefert einen Fehlerstatus, wenn mindestens ein Item fehlschlägt.
-        # Danach wird trotzdem jedes Item im Dateisystem geprüft.
-        if ! HOME="$SERVER_ROOT" "${command[@]}"; then
-            warn "SteamCMD reported at least one failed operation in batch ${batch_number}; checking individual item states."
+        if [[ -n "$source_dir" && -d "$source_dir/addons" ]]; then
+            expose_workshop_mod "$item_id" "$source_dir"
+            log "Workshop item ${item_id} is ready at @${item_id}."
+        else
+            failed_items+=("$item_id")
+        fi
+    done
+
+    if (( ${#failed_items[@]} > 0 )); then
+        if is_enabled "${DISABLE_MOD_UPDATES:-0}"; then
+            die "Workshop updates are disabled, but ${#failed_items[@]} required item(s) are missing. Set DISABLE_MOD_UPDATES=0 for one start."
         fi
 
-        for item_id in "${batch[@]}"; do
-            source_dir="$(find_workshop_content_dir "$item_id" || true)"
-
-            if [[ -n "$source_dir" && -d "$source_dir/addons" ]]; then
-                expose_workshop_mod "$item_id" "$source_dir"
-                log "Workshop item ${item_id} is ready at @${item_id}."
-            else
-                failed_items+=("$item_id")
-            fi
+        for item_id in "${failed_items[@]}"; do
+            download_workshop_item_with_retries "$item_id"
         done
-
-        start_index=$((start_index + ${#batch[@]}))
-    done
-
-    # Nur fehlende oder unvollständige Downloads werden einzeln wiederholt.
-    for item_id in "${failed_items[@]}"; do
-        warn "Workshop item ${item_id} was not usable after batch processing; retrying individually."
-        download_and_expose_workshop_item "$item_id"
-    done
+    fi
 }
 
-normalise_mod_paths() {
-    local variable_name="$1"
-    local current_value="${!variable_name:-}"
+build_mod_paths() {
+    local source_variable="$1"
+    local target_array_name="$2"
+    local current_value="${!source_variable:-}"
     local -a entries=()
-
+    local -a normal_entries=()
+    local -a cba_entries=()
+    local -A seen_paths=()
     local entry
-    local joined=''
+    local full_path
+    local -n target_array="$target_array_name"
+
+    target_array=()
 
     IFS=';' read -r -a entries <<<"${current_value%;}"
 
     for entry in "${entries[@]}"; do
-        entry="$(trim_all_whitespace "$entry")"
+        entry="$(trim "$entry")"
         [[ -n "$entry" ]] || continue
 
-        # Relative Pfade im Server-Root werden absolut übergeben.
-        # Bereits absolute oder unbekannte manuelle Werte bleiben unverändert.
-        if [[ "$entry" != /* && -d "${SERVER_ROOT}/${entry}" ]]; then
-            entry="${SERVER_ROOT}/${entry}"
+        if [[ "$entry" == /* ]]; then
+            full_path="$entry"
+        else
+            full_path="${SERVER_ROOT}/${entry}"
         fi
 
-        joined+="${entry};"
+        if [[ ! -d "$full_path" ]]; then
+            warn "Configured mod path does not exist and will be skipped: ${full_path}"
+            continue
+        fi
+
+        if [[ ! -d "$full_path/addons" ]]; then
+            warn "Configured mod path has no addons directory and will be skipped: ${full_path}"
+            continue
+        fi
+
+        [[ -z "${seen_paths[$full_path]:-}" ]] || continue
+        seen_paths["$full_path"]=1
+
+        # CBA_A3 is a common hard dependency and should load before dependent
+        # gameplay mods. It is harmless when absent.
+        if [[ "$full_path" == "${SERVER_ROOT}/@450814997" ]]; then
+            cba_entries+=("$full_path")
+        else
+            normal_entries+=("$full_path")
+        fi
     done
 
-    printf -v "$variable_name" '%s' "$joined"
-    export "$variable_name"
+    target_array=("${cba_entries[@]}" "${normal_entries[@]}")
+}
 
-    log "${variable_name} prepared: ${joined:-<empty>}"
+join_mod_paths() {
+    local array_name="$1"
+    local -n paths="$array_name"
+    local joined=''
+    local path
+
+    for path in "${paths[@]}"; do
+        joined+="${path};"
+    done
+
+    printf '%s' "${joined%;}"
+}
+
+parse_startup_parameters() {
+    local raw_parameters="${STARTUP_PARAMS:--noLogs}"
+    local -n target_array="$1"
+
+    target_array=()
+
+    # The official egg treats this whole field as one quoted argument. Here it
+    # is intentionally split into individual CLI arguments, so
+    # "-noLogs -autoInit" becomes two parameters.
+    read -r -a target_array <<<"$raw_parameters"
+}
+
+print_command() {
+    local argument
+
+    printf '[STARTUP] Executing:' >&2
+    for argument in "$@"; do
+        printf ' %q' "$argument" >&2
+    done
+    printf '\n' >&2
+}
+
+start_arma_server() {
+    local -a client_mod_paths=()
+    local -a server_mod_paths=()
+    local -a extra_parameters=()
+    local -a command=()
+    local client_mod_argument
+    local server_mod_argument
+
+    build_mod_paths MODIFICATIONS client_mod_paths
+    build_mod_paths SERVERMODS server_mod_paths
+
+    client_mod_argument="$(join_mod_paths client_mod_paths)"
+    server_mod_argument="$(join_mod_paths server_mod_paths)"
+
+    log "CLIENT MODS ready: ${#client_mod_paths[@]}"
+    log "SERVER MODS ready: ${#server_mod_paths[@]}"
+
+    parse_startup_parameters extra_parameters
+
+    command=(
+        "./${SERVER_BINARY}"
+        '-ip=0.0.0.0'
+        "-port=${SERVER_PORT}"
+        '-profiles=./serverprofile'
+        '-bepath=./'
+        "-cfg=${BASIC_CONFIG}"
+        "-config=${SERVER_CONFIG}"
+    )
+
+    if [[ -n "$client_mod_argument" ]]; then
+        command+=("-mod=${client_mod_argument}")
+    fi
+
+    if [[ -n "$server_mod_argument" ]]; then
+        command+=("-serverMod=${server_mod_argument}")
+    fi
+
+    command+=("${extra_parameters[@]}")
+
+    print_command "${command[@]}"
+
+    exec "${command[@]}"
 }
 
 main() {
-    local client_collection="${STEAM_WORKSHOP_COLLECTION_URL:-}"
-    local server_collection="${STEAM_WORKSHOP_SERVERMODS_COLLECTION_URL:-}"
+    local client_collection
+    local server_collection
     local collection_result
     local item_id
 
@@ -494,16 +704,17 @@ main() {
 
     validate_runtime_settings
 
-    client_collection="$(trim_all_whitespace "$client_collection")"
-    server_collection="$(trim_all_whitespace "$server_collection")"
+    mkdir -p "${SERVER_ROOT}/keys" "${SERVER_ROOT}/serverprofile"
+    cd "$SERVER_ROOT"
+
+    client_collection="$(trim "${STEAM_WORKSHOP_COLLECTION_URL:-}")"
+    server_collection="$(trim "${STEAM_WORKSHOP_SERVERMODS_COLLECTION_URL:-}")"
 
     if [[ -n "$client_collection" ]]; then
         collection_result="$(resolve_collection_url "$client_collection")"
         mapfile -t client_collection_ids <<<"$collection_result"
 
-        append_workshop_ids_to_variable \
-            MODIFICATIONS \
-            "${client_collection_ids[@]}"
+        append_workshop_ids_to_variable MODIFICATIONS "${client_collection_ids[@]}"
 
         log "Added ${#client_collection_ids[@]} item(s) to MODIFICATIONS."
     else
@@ -514,18 +725,13 @@ main() {
         collection_result="$(resolve_collection_url "$server_collection")"
         mapfile -t server_collection_ids <<<"$collection_result"
 
-        append_workshop_ids_to_variable \
-            SERVERMODS \
-            "${server_collection_ids[@]}"
+        append_workshop_ids_to_variable SERVERMODS "${server_collection_ids[@]}"
 
         log "Added ${#server_collection_ids[@]} item(s) to SERVERMODS."
     else
         log 'No STEAM_WORKSHOP_SERVERMODS_COLLECTION_URL configured; SERVERMODS remains unchanged.'
     fi
 
-    # Neben Collections werden auch manuell eingetragene @<Workshop-ID>-Mods
-    # verarbeitet. IDs aus Client-, Server- und optionalen Mods werden vor
-    # dem Download zusammengeführt und dedupliziert.
     while IFS= read -r item_id; do
         [[ "$item_id" =~ ^[0-9]{5,20}$ ]] || continue
         [[ -z "${seen_workshop_ids[$item_id]:-}" ]] || continue
@@ -538,16 +744,9 @@ main() {
         collect_workshop_ids_from_variable OPTIONALMODS
     )
 
-    download_and_expose_workshop_items_batch "${all_workshop_ids[@]}"
-
-    normalise_mod_paths MODIFICATIONS
-    normalise_mod_paths SERVERMODS
-
-    # Kompatibilität mit Upstream-Image-Varianten, die CLIENT_MODS direkt
-    # konsumieren statt es aus MODIFICATIONS abzuleiten.
-    export CLIENT_MODS="$MODIFICATIONS"
-
-    exec "$UPSTREAM_ENTRYPOINT" "$@"
+    steamcmd_update_server
+    prepare_workshop_items "${all_workshop_ids[@]}"
+    start_arma_server
 }
 
 main "$@"
