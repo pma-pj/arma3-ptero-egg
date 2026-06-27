@@ -564,22 +564,29 @@ build_mod_paths() {
     local source_variable="$1"
     local target_array_name="$2"
     local current_value="${!source_variable:-}"
+
     local -a entries=()
     local -a normal_entries=()
     local -a cba_entries=()
+
     local -A seen_paths=()
+
     local entry
     local full_path
+
+    # Bash nameref auf das Ziel-Array, z. B. client_mod_paths.
     local -n target_array="$target_array_name"
 
     target_array=()
 
+    # Semikolon-getrennte Egg-Variable in einzelne Mod-Einträge zerlegen.
     IFS=';' read -r -a entries <<<"${current_value%;}"
 
     for entry in "${entries[@]}"; do
         entry="$(trim "$entry")"
         [[ -n "$entry" ]] || continue
 
+        # Für die Dateisystem-Prüfung immer einen absoluten Pfad verwenden.
         if [[ "$entry" == /* ]]; then
             full_path="$entry"
         else
@@ -596,19 +603,35 @@ build_mod_paths() {
             continue
         fi
 
+        # Doppelte Einträge verhindern. Die Prüfung erfolgt über den absoluten
+        # Pfad, damit @123 und /home/container/@123 nicht doppelt auftauchen.
         [[ -z "${seen_paths[$full_path]:-}" ]] || continue
         seen_paths["$full_path"]=1
 
-        # CBA_A3 is a common hard dependency and should load before dependent
-        # gameplay mods. It is harmless when absent.
-        if [[ "$full_path" == "${SERVER_ROOT}/@450814997" ]]; then
-            cba_entries+=("$full_path")
+        # Wichtig:
+        # Für Mods innerhalb des Server-Roots übergeben wir Arma wieder den
+        # relativen Namen, z. B. @3020755032, statt /home/container/@3020755032.
+        #
+        # Manuell angegebene absolute Pfade außerhalb des Server-Roots werden
+        # bewusst unverändert gelassen.
+        if [[ "$full_path" == "${SERVER_ROOT}/"* ]]; then
+            entry="${full_path#"${SERVER_ROOT}/"}"
         else
-            normal_entries+=("$full_path")
+            entry="$full_path"
+        fi
+
+        # CBA zuerst laden, weil es eine Abhängigkeit vieler anderer Mods ist.
+        if [[ "$entry" == "@450814997" ]]; then
+            cba_entries+=("$entry")
+        else
+            normal_entries+=("$entry")
         fi
     done
 
-    target_array=("${cba_entries[@]}" "${normal_entries[@]}")
+    target_array=(
+        "${cba_entries[@]}"
+        "${normal_entries[@]}"
+    )
 }
 
 join_mod_paths() {
@@ -619,8 +642,7 @@ join_mod_paths() {
 
     for path in "${paths[@]}"; do
         if [[ -n "$joined" ]]; then
-            # Linux-Arma benötigt den Backslash als Teil des Arguments.
-            joined+='\;'
+            joined+=';'
         fi
 
         joined+="$path"
