@@ -112,7 +112,7 @@ resolve_collection() {
     done < <(
         jq -r '
             .response.collectiondetails[0].children[]?
-            | "\(.filetype // 0)\t\(.publishedfileid // \"\")"
+            | "\(.filetype // 0)\t\(.publishedfileid // "")"
         ' <<<"$response"
     )
 }
@@ -146,8 +146,14 @@ append_collection_to_modifications() {
     echo "[COLLECTION] Added ${#workshop_items[@]} Workshop item(s) to MODIFICATIONS."
 }
 
-if [[ -n "${STEAM_WORKSHOP_COLLECTION_URL:-}" ]]; then
-    append_collection_to_modifications "$STEAM_WORKSHOP_COLLECTION_URL"
+collection_url="${STEAM_WORKSHOP_COLLECTION_URL:-}"
+
+# Pterodactyl can pass an empty variable containing whitespace. Treat that like
+# an unset value rather than attempting to resolve an invalid collection.
+collection_url="${collection_url//[[:space:]]/}"
+
+if [[ -n "$collection_url" ]]; then
+    append_collection_to_modifications "$collection_url"
 else
     echo '[COLLECTION] No STEAM_WORKSHOP_COLLECTION_URL configured; using the upstream mod configuration unchanged.'
 fi
