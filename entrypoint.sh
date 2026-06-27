@@ -36,6 +36,7 @@ STEAMCMD_ATTEMPTS="${STEAMCMD_ATTEMPTS:-3}"
 STEAMCMD_RETRY_DELAY="${STEAMCMD_RETRY_DELAY:-5}"
 STEAMCMD_BATCH_SIZE="${STEAMCMD_BATCH_SIZE:-50}"
 WORKSHOP_VALIDATE="${WORKSHOP_VALIDATE:-0}"
+LOWERCASE_WORKSHOP_FILES="${LOWERCASE_WORKSHOP_FILES:-1}"
 
 log() {
     printf '[COLLECTION] %s\n' "$*" >&2
@@ -357,6 +358,47 @@ publishedid = ${item_id};
 EOF
 }
 
+normalise_mod_filenames() {
+    local mod_dir="$1"
+    local source_file
+    local target_file
+    local renamed_count=0
+
+    is_enabled "$LOWERCASE_WORKSHOP_FILES" || return 0
+
+    # Arma 3 unter Linux erwartet insbesondere PBO- und BISIGN-Dateien in
+    # Kleinbuchstaben. Workshop-Mods enthalten teilweise Windows-Dateinamen
+    # mit Großbuchstaben, die auf Linux sonst nicht auflösbar sind.
+    while IFS= read -r -d '' source_file; do
+        target_file="${source_file,,}"
+
+        [[ "$source_file" == "$target_file" ]] && continue
+
+        # SteamCMD kann nach Updates sowohl die alte klein geschriebene als
+        # auch die neue Originaldatei mit Großbuchstaben hinterlassen.
+        # Die aktuelle Workshop-Datei mit Großbuchstaben überschreibt dann
+        # bewusst die ältere klein geschriebene Variante.
+        if [[ -e "$target_file" ]]; then
+            rm -f -- "$target_file"
+        fi
+
+        mv -- "$source_file" "$target_file" \
+            || die "Could not lowercase Workshop file '${source_file}'."
+
+        renamed_count=$((renamed_count + 1))
+    done < <(
+        LC_ALL=C find "$mod_dir" \
+            -type f \
+            \( -iname '*.pbo' -o -iname '*.bisign' \) \
+            -name '*[[:upper:]]*' \
+            -print0
+    )
+
+    if (( renamed_count > 0 )); then
+        log "Normalized ${renamed_count} uppercase PBO/BISIGN file(s) in ${mod_dir}."
+    fi
+}
+
 expose_workshop_mod() {
     local item_id="$1"
     local source_dir="$2"
@@ -367,6 +409,7 @@ expose_workshop_mod() {
     resolved_source="$(readlink -f "$source_dir")"
 
     if [[ -d "$target_dir/addons" && ! -L "$target_dir" ]]; then
+        normalise_mod_filenames "$target_dir"
         ensure_workshop_meta "$item_id" "$target_dir"
         copy_bikeys "$target_dir"
         return 0
@@ -389,6 +432,7 @@ expose_workshop_mod() {
     [[ -d "$target_dir/addons" ]] \
         || die "Workshop item ${item_id} was downloaded, but ${target_dir}/addons is missing."
 
+    normalise_mod_filenames "$source_dir"
     ensure_workshop_meta "$item_id" "$target_dir"
     copy_bikeys "$source_dir"
 }
