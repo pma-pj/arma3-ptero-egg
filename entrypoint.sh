@@ -6,10 +6,10 @@
 #   STEAM_WORKSHOP_SERVERMODS_COLLECTION_URL
 #
 # Behaviour:
-#   - Resolves Workshop collections through Steam's collection API.
+#   - Resolves Steam Workshop collections through Steam's collection API.
 #   - Adds normal collection items to MODIFICATIONS.
 #   - Adds server-only collection items to SERVERMODS.
-#   - Downloads all @<Workshop-ID> entries itself via SteamCMD.
+#   - Downloads Workshop items with SteamCMD in batches of at most 50 items.
 #   - Exposes every Workshop item at /home/container/@<id>.
 #   - Copies .bikey files to /home/container/keys.
 #   - Converts known mod folders to absolute paths before invoking the
@@ -24,10 +24,14 @@ readonly STEAM_COLLECTION_API="${STEAM_COLLECTION_API:-https://api.steampowered.
 readonly MAX_COLLECTION_DEPTH="${MAX_COLLECTION_DEPTH:-8}"
 readonly MAX_COLLECTION_ITEMS="${MAX_COLLECTION_ITEMS:-500}"
 
+readonly MAX_STEAMCMD_BATCH_SIZE=50
 readonly STEAMCMD_ATTEMPTS="${STEAMCMD_ATTEMPTS:-5}"
 readonly STEAMCMD_RETRY_DELAY="${STEAMCMD_RETRY_DELAY:-5}"
 
 readonly UPSTREAM_ENTRYPOINT="${UPSTREAM_ENTRYPOINT:-/entrypoint-upstream.sh}"
+
+# Kann zur Fehlersuche kleiner gesetzt werden, wird aber nie höher als 50.
+STEAMCMD_BATCH_SIZE="${STEAMCMD_BATCH_SIZE:-50}"
 
 log() {
     printf '[COLLECTION] %s\n' "$*" >&2
@@ -42,9 +46,25 @@ die() {
     exit 1
 }
 
+validate_runtime_settings() {
+    [[ "$STEAMCMD_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] \
+        || die 'STEAMCMD_ATTEMPTS must be a positive integer.'
+
+    [[ "$STEAMCMD_RETRY_DELAY" =~ ^[0-9]+$ ]] \
+        || die 'STEAMCMD_RETRY_DELAY must be a non-negative integer.'
+
+    [[ "$STEAMCMD_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] \
+        || die 'STEAMCMD_BATCH_SIZE must be a positive integer.'
+
+    if (( STEAMCMD_BATCH_SIZE > MAX_STEAMCMD_BATCH_SIZE )); then
+        warn "STEAMCMD_BATCH_SIZE=${STEAMCMD_BATCH_SIZE} exceeds the hard limit of ${MAX_STEAMCMD_BATCH_SIZE}; using ${MAX_STEAMCMD_BATCH_SIZE}."
+        STEAMCMD_BATCH_SIZE="$MAX_STEAMCMD_BATCH_SIZE"
+    fi
+}
+
 trim_all_whitespace() {
-    # Steam URLs and Workshop IDs cannot contain whitespace. This also treats
-    # a Pterodactyl variable containing only spaces/newlines as unset.
+    # Steam-URLs und Workshop-IDs enthalten keine Leerzeichen. Das behandelt
+    # auch Pterodactyl-Variablen nur mit Leerzeichen als nicht gesetzt.
     printf '%s' "$1" | tr -d '[:space:]'
 }
 
@@ -68,6 +88,7 @@ extract_collection_id() {
 fetch_collection_json() {
     local collection_id="$1"
     local response
+    local result
 
     response="$(
         curl \
@@ -91,7 +112,6 @@ fetch_collection_json() {
         >/dev/null <<<"$response" \
         || die "Steam returned an unexpected response for collection ${collection_id}."
 
-    local result
     result="$(jq -r '.response.collectiondetails[0].result // empty' <<<"$response")"
 
     [[ "$result" == '1' ]] \
@@ -107,6 +127,9 @@ declare -a RESOLVED_ITEM_IDS=()
 resolve_collection_tree() {
     local collection_id="$1"
     local depth="$2"
+    local response
+    local child_type
+    local child_id
 
     (( depth <= MAX_COLLECTION_DEPTH )) \
         || die "Maximum nested collection depth (${MAX_COLLECTION_DEPTH}) exceeded."
@@ -114,16 +137,12 @@ resolve_collection_tree() {
     [[ -z "${RESOLVED_COLLECTIONS[$collection_id]:-}" ]] || return 0
     RESOLVED_COLLECTIONS["$collection_id"]=1
 
-    local response
     response="$(fetch_collection_json "$collection_id")"
-
-    local child_type
-    local child_id
 
     while IFS=$'\t' read -r child_type child_id; do
         [[ "$child_id" =~ ^[0-9]{5,20}$ ]] || continue
 
-        # Steam filetype 2 represents a nested Workshop collection.
+        # Steam filetype 2 identifiziert eine verschachtelte Collection.
         if [[ "$child_type" == '2' ]]; then
             log "Resolving nested Steam Workshop collection: ${child_id}"
             resolve_collection_tree "$child_id" "$((depth + 1))"
@@ -172,7 +191,6 @@ append_workshop_ids_to_variable() {
     local current_value="${!variable_name:-}"
     local -a entries=()
     local -A seen_entries=()
-
     local entry
     local id
     local joined=''
@@ -183,7 +201,6 @@ append_workshop_ids_to_variable() {
         entry="$(trim_all_whitespace "$entry")"
         [[ -n "$entry" ]] || continue
 
-        # Normalise manually configured @<Workshop-ID> entries.
         if [[ "$entry" =~ ^@([0-9]{5,20})$ ]]; then
             entry="@${BASH_REMATCH[1]}"
         fi
@@ -213,7 +230,6 @@ collect_workshop_ids_from_variable() {
     local variable_name="$1"
     local current_value="${!variable_name:-}"
     local -a entries=()
-
     local entry
 
     IFS=';' read -r -a entries <<<"${current_value%;}"
@@ -259,7 +275,6 @@ find_workshop_content_dir() {
         fi
     done
 
-    # SteamCMD can use a different Steam library path depending on image version.
     candidate="$(
         find \
             "$SERVER_ROOT" \
@@ -302,7 +317,7 @@ expose_workshop_mod() {
 
     resolved_source="$(readlink -f "$source_dir")"
 
-    # Eine echte, bereits funktionierende Root-Modinstallation beibehalten.
+    # Bereits vorhandene, echte und gültige Mod-Verzeichnisse beibehalten.
     if [[ -d "$target_dir/addons" && ! -L "$target_dir" ]]; then
         copy_bikeys "$target_dir"
         return 0
@@ -331,17 +346,16 @@ expose_workshop_mod() {
 download_and_expose_workshop_item() {
     local item_id="$1"
     local steamcmd
+    local attempt
+    local source_dir
 
     steamcmd="$(steamcmd_binary)"
 
     [[ -n "${STEAM_USER:-}" && -n "${STEAM_PASS:-}" ]] \
         || die 'STEAM_USER and STEAM_PASS must be configured for Workshop downloads.'
 
-    local attempt
-    local source_dir
-
     for ((attempt = 1; attempt <= STEAMCMD_ATTEMPTS; attempt++)); do
-        log "Downloading Workshop item ${item_id} (attempt ${attempt}/${STEAMCMD_ATTEMPTS})..."
+        log "Retrying Workshop item ${item_id} individually (attempt ${attempt}/${STEAMCMD_ATTEMPTS})..."
 
         if HOME="$SERVER_ROOT" "$steamcmd" \
             +login "$STEAM_USER" "$STEAM_PASS" \
@@ -368,6 +382,75 @@ download_and_expose_workshop_item() {
     die "Could not download Workshop item ${item_id} after ${STEAMCMD_ATTEMPTS} attempt(s)."
 }
 
+download_and_expose_workshop_items_batch() {
+    local steamcmd
+    local item_id
+    local source_dir
+    local start_index=0
+    local total_items="$#"
+    local batch_number=0
+
+    local -a all_items=("$@")
+    local -a batch=()
+    local -a command=()
+    local -a failed_items=()
+
+    (( total_items > 0 )) || return 0
+
+    steamcmd="$(steamcmd_binary)"
+
+    [[ -n "${STEAM_USER:-}" && -n "${STEAM_PASS:-}" ]] \
+        || die 'STEAM_USER and STEAM_PASS must be configured for Workshop downloads.'
+
+    while (( start_index < total_items )); do
+        batch=("${all_items[@]:start_index:STEAMCMD_BATCH_SIZE}")
+        batch_number=$((batch_number + 1))
+
+        log "Downloading ${#batch[@]} Workshop item(s) in SteamCMD batch ${batch_number} (maximum ${MAX_STEAMCMD_BATCH_SIZE} per session)..."
+
+        command=(
+            "$steamcmd"
+            +login "$STEAM_USER" "$STEAM_PASS"
+        )
+
+        for item_id in "${batch[@]}"; do
+            command+=(
+                +workshop_download_item
+                "$WORKSHOP_APP_ID"
+                "$item_id"
+                validate
+            )
+        done
+
+        command+=(+quit)
+
+        # SteamCMD liefert einen Fehlerstatus, wenn mindestens ein Item fehlschlägt.
+        # Danach wird trotzdem jedes Item im Dateisystem geprüft.
+        if ! HOME="$SERVER_ROOT" "${command[@]}"; then
+            warn "SteamCMD reported at least one failed operation in batch ${batch_number}; checking individual item states."
+        fi
+
+        for item_id in "${batch[@]}"; do
+            source_dir="$(find_workshop_content_dir "$item_id" || true)"
+
+            if [[ -n "$source_dir" && -d "$source_dir/addons" ]]; then
+                expose_workshop_mod "$item_id" "$source_dir"
+                log "Workshop item ${item_id} is ready at @${item_id}."
+            else
+                failed_items+=("$item_id")
+            fi
+        done
+
+        start_index=$((start_index + ${#batch[@]}))
+    done
+
+    # Nur fehlende oder unvollständige Downloads werden einzeln wiederholt.
+    for item_id in "${failed_items[@]}"; do
+        warn "Workshop item ${item_id} was not usable after batch processing; retrying individually."
+        download_and_expose_workshop_item "$item_id"
+    done
+}
+
 normalise_mod_paths() {
     local variable_name="$1"
     local current_value="${!variable_name:-}"
@@ -382,8 +465,8 @@ normalise_mod_paths() {
         entry="$(trim_all_whitespace "$entry")"
         [[ -n "$entry" ]] || continue
 
-        # Relative mod folders in /home/container become absolute. Unknown
-        # values remain untouched, so manually configured special paths survive.
+        # Relative Pfade im Server-Root werden absolut übergeben.
+        # Bereits absolute oder unbekannte manuelle Werte bleiben unverändert.
         if [[ "$entry" != /* && -d "${SERVER_ROOT}/${entry}" ]]; then
             entry="${SERVER_ROOT}/${entry}"
         fi
@@ -400,8 +483,8 @@ normalise_mod_paths() {
 main() {
     local client_collection="${STEAM_WORKSHOP_COLLECTION_URL:-}"
     local server_collection="${STEAM_WORKSHOP_SERVERMODS_COLLECTION_URL:-}"
-
     local collection_result
+    local item_id
 
     local -a client_collection_ids=()
     local -a server_collection_ids=()
@@ -409,7 +492,7 @@ main() {
 
     local -A seen_workshop_ids=()
 
-    local item_id
+    validate_runtime_settings
 
     client_collection="$(trim_all_whitespace "$client_collection")"
     server_collection="$(trim_all_whitespace "$server_collection")"
@@ -440,9 +523,9 @@ main() {
         log 'No STEAM_WORKSHOP_SERVERMODS_COLLECTION_URL configured; SERVERMODS remains unchanged.'
     fi
 
-    # Neben Collections auch manuell eingetragene @<Workshop-ID>-Mods behandeln.
-    # OPTIONALMODS wird heruntergeladen, damit der Upstream-Entrypoint dessen
-    # Signaturen/Keys weiterhin nutzen kann.
+    # Neben Collections werden auch manuell eingetragene @<Workshop-ID>-Mods
+    # verarbeitet. IDs aus Client-, Server- und optionalen Mods werden vor
+    # dem Download zusammengeführt und dedupliziert.
     while IFS= read -r item_id; do
         [[ "$item_id" =~ ^[0-9]{5,20}$ ]] || continue
         [[ -z "${seen_workshop_ids[$item_id]:-}" ]] || continue
@@ -455,16 +538,13 @@ main() {
         collect_workshop_ids_from_variable OPTIONALMODS
     )
 
-    for item_id in "${all_workshop_ids[@]}"; do
-        download_and_expose_workshop_item "$item_id"
-    done
+    download_and_expose_workshop_items_batch "${all_workshop_ids[@]}"
 
     normalise_mod_paths MODIFICATIONS
     normalise_mod_paths SERVERMODS
 
-    # Das Upstream-Image leitet normalerweise MODIFICATIONS nach CLIENT_MODS
-    # ab. Der Export ist zusätzlich kompatibel mit Varianten, die CLIENT_MODS
-    # direkt verwenden.
+    # Kompatibilität mit Upstream-Image-Varianten, die CLIENT_MODS direkt
+    # konsumieren statt es aus MODIFICATIONS abzuleiten.
     export CLIENT_MODS="$MODIFICATIONS"
 
     exec "$UPSTREAM_ENTRYPOINT" "$@"
