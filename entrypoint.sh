@@ -673,6 +673,34 @@ print_command() {
     printf '\n' >&2
 }
 
+prepare_arma_runtime() {
+    export USER_ID
+    export GROUP_ID
+
+    USER_ID="$(id -u)"
+    GROUP_ID="$(id -g)"
+
+    # Das Basis-Image setzt diese Variablen sowie /passwd.template bereit.
+    # Ohne NSS-Wrapper kann Arma im Container beim Start segfaulten.
+    if [[ -n "${NSS_WRAPPER_PASSWD:-}" ]] \
+        && [[ -n "${NSS_WRAPPER_GROUP:-}" ]] \
+        && [[ -f "/passwd.template" ]] \
+        && command -v envsubst >/dev/null 2>&1; then
+
+        envsubst < /passwd.template > "${NSS_WRAPPER_PASSWD}"
+    else
+        warn 'NSS-wrapper variables or /passwd.template are missing; starting without generated passwd wrapper.'
+    fi
+
+    if [[ "$SERVER_BINARY" == *x64* ]]; then
+        export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libnss_wrapper.so${LD_PRELOAD:+:${LD_PRELOAD}}"
+    else
+        export LD_PRELOAD="/usr/lib/i386-linux-gnu/libnss_wrapper.so${LD_PRELOAD:+:${LD_PRELOAD}}"
+    fi
+
+    log "Prepared NSS runtime environment for ${SERVER_BINARY}."
+}
+
 start_arma_server() {
     local -a client_mod_paths=()
     local -a server_mod_paths=()
@@ -711,6 +739,8 @@ start_arma_server() {
     fi
 
     command+=("${extra_parameters[@]}")
+
+    prepare_arma_runtime
 
     print_command "${command[@]}"
 
