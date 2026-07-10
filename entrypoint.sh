@@ -393,13 +393,13 @@ normalise_mod_filenames() {
     done < <(
         LC_ALL=C find "$mod_dir" \
             -type f \
-            \( -iname '*.pbo' -o -iname '*.bisign' \) \
+            -iname '*.pbo' \
             -name '*[[:upper:]]*' \
             -print0
     )
 
     if (( renamed_count > 0 )); then
-        log "Normalized ${renamed_count} uppercase PBO/BISIGN file(s) in ${mod_dir}."
+        log "Normalized ${renamed_count} uppercase PBO file(s) in ${mod_dir}."
     fi
 }
 
