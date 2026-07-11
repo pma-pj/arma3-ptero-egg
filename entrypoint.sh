@@ -37,6 +37,7 @@ STEAMCMD_RETRY_DELAY="${STEAMCMD_RETRY_DELAY:-5}"
 STEAMCMD_BATCH_SIZE="${STEAMCMD_BATCH_SIZE:-50}"
 WORKSHOP_VALIDATE="${WORKSHOP_VALIDATE:-0}"
 LOWERCASE_WORKSHOP_FILES="${LOWERCASE_WORKSHOP_FILES:-1}"
+SKIP_UNSIGNED_MODS="${SKIP_UNSIGNED_MODS:-1}"
 CLEAN_KEYS_ON_START="${CLEAN_KEYS_ON_START:-1}"
 
 log() {
@@ -729,6 +730,65 @@ prepare_workshop_items() {
     fi
 }
 
+mod_has_required_signatures() {
+    local mod_path="$1"
+    local mod_name="$2"
+    local addons_dir="${mod_path}/addons"
+
+    local pbo_file
+    local pbo_dir
+    local pbo_name
+    local matching_signature
+    local missing_count=0
+    local checked_count=0
+
+    # Wenn deaktiviert, wird nichts gefiltert.
+    is_enabled "$SKIP_UNSIGNED_MODS" || return 0
+
+    if [[ ! -d "$addons_dir" ]]; then
+        warn "Skipping signature check for ${mod_name}: addons directory missing."
+        return 1
+    fi
+
+    while IFS= read -r -d '' pbo_file; do
+        checked_count=$((checked_count + 1))
+
+        pbo_dir="$(dirname -- "$pbo_file")"
+        pbo_name="$(basename -- "$pbo_file")"
+
+        matching_signature="$(
+            find "$pbo_dir" \
+                -maxdepth 1 \
+                -type f \
+                -name "${pbo_name}.*.bisign" \
+                -print \
+                -quit
+        )"
+
+        if [[ -z "$matching_signature" ]]; then
+            warn "Unsigned PBO detected in ${mod_name}: ${pbo_file}"
+            missing_count=$((missing_count + 1))
+        fi
+    done < <(
+        LC_ALL=C find "$addons_dir" \
+            -type f \
+            -iname '*.pbo' \
+            -print0
+    )
+
+    if (( checked_count == 0 )); then
+        warn "Skipping mod ${mod_name}: no PBO files found in ${addons_dir}."
+        return 1
+    fi
+
+    if (( missing_count > 0 )); then
+        warn "Skipping mod ${mod_name}: ${missing_count}/${checked_count} PBO file(s) have no matching BISIGN."
+        return 1
+    fi
+
+    return 0
+}
+
 build_mod_paths() {
     local source_variable="$1"
     local target_array_name="$2"
@@ -742,6 +802,7 @@ build_mod_paths() {
 
     local entry
     local full_path
+    local arma_entry
 
     # Bash nameref auf das Ziel-Array, z. B. client_mod_paths.
     local -n target_array="$target_array_name"
@@ -781,19 +842,26 @@ build_mod_paths() {
         # Für Mods innerhalb des Server-Roots übergeben wir Arma wieder den
         # relativen Namen, z. B. @3020755032, statt /home/container/@3020755032.
         #
-        # Manuell angegebene absolute Pfade außerhalb des Server-Roots werden
-        # bewusst unverändert gelassen.
+        # Manuell angegebene absolute Pfade außerhalb des Server-Roots bleiben
+        # bewusst absolute Pfade.
         if [[ "$full_path" == "${SERVER_ROOT}/"* ]]; then
-            entry="${full_path#"${SERVER_ROOT}/"}"
+            arma_entry="${full_path#"${SERVER_ROOT}/"}"
         else
-            entry="$full_path"
+            arma_entry="$full_path"
+        fi
+
+        # Optionaler Schutz:
+        # Wenn ein Mod mindestens eine .pbo ohne passende .bisign enthält,
+        # wird der komplette Mod nicht an -mod/-serverMod übergeben.
+        if ! mod_has_required_signatures "$full_path" "$arma_entry"; then
+            continue
         fi
 
         # CBA zuerst laden, weil es eine Abhängigkeit vieler anderer Mods ist.
-        if [[ "$entry" == "@450814997" ]]; then
-            cba_entries+=("$entry")
+        if [[ "$arma_entry" == "@450814997" ]]; then
+            cba_entries+=("$arma_entry")
         else
-            normal_entries+=("$entry")
+            normal_entries+=("$arma_entry")
         fi
     done
 
