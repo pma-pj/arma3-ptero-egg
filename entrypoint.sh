@@ -360,34 +360,87 @@ EOF
 
 normalise_mod_filenames() {
     local mod_dir="$1"
-    local source_file
-    local source_dir
-    local source_name
-    local target_name
-    local target_file
+
+    local pbo_file
+    local pbo_dir
+    local pbo_name
+    local pbo_lower_name
+    local pbo_lower_file
+
+    local sig_file
+    local sig_dir
+    local sig_name
+    local sig_suffix
+    local sig_lower_file
+
     local renamed_count=0
 
     is_enabled "$LOWERCASE_WORKSHOP_FILES" || return 0
 
-    # Nur den Dateinamen selbst klein schreiben.
-    # Verzeichnisnamen wie /home/container/Steam bleiben unverändert.
-    while IFS= read -r -d '' source_file; do
-        source_dir="$(dirname -- "$source_file")"
-        source_name="$(basename -- "$source_file")"
-        target_name="${source_name,,}"
-        target_file="${source_dir}/${target_name}"
+    # Zuerst alle .bisign-Dateien passend zu ihren .pbo-Dateien normalisieren.
+    #
+    # Beispiel:
+    #   hlc_wp_ACR.pbo.niarms.bisign
+    # wird:
+    #   hlc_wp_acr.pbo.niarms.bisign
+    #
+    # Wichtig: Nur der Dateiname wird geändert, nicht der absolute Pfad.
+    while IFS= read -r -d '' pbo_file; do
+        pbo_dir="$(dirname -- "$pbo_file")"
+        pbo_name="$(basename -- "$pbo_file")"
+        pbo_lower_name="${pbo_name,,}"
 
-        [[ "$source_name" == "$target_name" ]] && continue
+        # Alle Signaturen suchen, die exakt zu diesem bisherigen PBO-Namen gehören.
+        while IFS= read -r -d '' sig_file; do
+            sig_dir="$(dirname -- "$sig_file")"
+            sig_name="$(basename -- "$sig_file")"
 
-        # Falls nach einem vorherigen Update bereits eine alte lowercase-Datei
-        # existiert, wird sie durch die aktuelle Workshop-Datei ersetzt.
-        if [[ -e "$target_file" ]]; then
-            rm -f -- "$target_file" \
-                || die "Could not remove existing lowercase file '${target_file}'."
+            # Alles nach "<PBO-Dateiname>." bleibt erhalten.
+            sig_suffix="${sig_name#${pbo_name}.}"
+            sig_lower_file="${sig_dir}/${pbo_lower_name}.${sig_suffix}"
+
+            if [[ "$sig_file" != "$sig_lower_file" ]]; then
+                if [[ -e "$sig_lower_file" ]]; then
+                    rm -f -- "$sig_lower_file" \
+                        || die "Could not remove existing lowercase signature '${sig_lower_file}'."
+                fi
+
+                mv -- "$sig_file" "$sig_lower_file" \
+                    || die "Could not lowercase BISIGN file '${sig_file}'."
+
+                renamed_count=$((renamed_count + 1))
+            fi
+        done < <(
+            find "$pbo_dir" \
+                -maxdepth 1 \
+                -type f \
+                -name "${pbo_name}.*.bisign" \
+                -print0
+        )
+    done < <(
+        LC_ALL=C find "$mod_dir" \
+            -type f \
+            -iname '*.pbo' \
+            -name '*[[:upper:]]*' \
+            -print0
+    )
+
+    # Danach die PBOs selbst klein schreiben.
+    while IFS= read -r -d '' pbo_file; do
+        pbo_dir="$(dirname -- "$pbo_file")"
+        pbo_name="$(basename -- "$pbo_file")"
+        pbo_lower_name="${pbo_name,,}"
+        pbo_lower_file="${pbo_dir}/${pbo_lower_name}"
+
+        [[ "$pbo_name" == "$pbo_lower_name" ]] && continue
+
+        if [[ -e "$pbo_lower_file" ]]; then
+            rm -f -- "$pbo_lower_file" \
+                || die "Could not remove existing lowercase PBO '${pbo_lower_file}'."
         fi
 
-        mv -- "$source_file" "$target_file" \
-            || die "Could not lowercase Workshop file '${source_file}'."
+        mv -- "$pbo_file" "$pbo_lower_file" \
+            || die "Could not lowercase PBO file '${pbo_file}'."
 
         renamed_count=$((renamed_count + 1))
     done < <(
@@ -399,7 +452,7 @@ normalise_mod_filenames() {
     )
 
     if (( renamed_count > 0 )); then
-        log "Normalized ${renamed_count} uppercase PBO file(s) in ${mod_dir}."
+        log "Normalized ${renamed_count} PBO/BISIGN filename(s) in ${mod_dir}."
     fi
 }
 
