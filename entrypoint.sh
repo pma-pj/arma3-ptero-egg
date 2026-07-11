@@ -37,6 +37,7 @@ STEAMCMD_RETRY_DELAY="${STEAMCMD_RETRY_DELAY:-5}"
 STEAMCMD_BATCH_SIZE="${STEAMCMD_BATCH_SIZE:-50}"
 WORKSHOP_VALIDATE="${WORKSHOP_VALIDATE:-0}"
 LOWERCASE_WORKSHOP_FILES="${LOWERCASE_WORKSHOP_FILES:-1}"
+CLEAN_KEYS_ON_START="${CLEAN_KEYS_ON_START:-1}"
 
 log() {
     printf '[COLLECTION] %s\n' "$*" >&2
@@ -328,18 +329,50 @@ find_workshop_content_dir() {
     return 1
 }
 
+prepare_keys_directory() {
+    local keys_dir="${SERVER_ROOT}/keys"
+
+    mkdir -p "$keys_dir"
+
+    is_enabled "$CLEAN_KEYS_ON_START" || return 0
+
+    find "$keys_dir" \
+        -maxdepth 1 \
+        -type f \
+        -iname '*.bikey' \
+        -delete
+
+    log "Cleaned server keys directory."
+}
+
 copy_bikeys() {
     local mod_dir="$1"
     local keys_dir="${SERVER_ROOT}/keys"
+
     local key_file
+    local key_name
+    local key_target
+    local copied_count=0
 
     mkdir -p "$keys_dir"
 
     while IFS= read -r -d '' key_file; do
-        cp -f "$key_file" "$keys_dir/"
+        key_name="$(basename -- "$key_file")"
+        key_target="${keys_dir}/${key_name}"
+
+        cp -f -- "$key_file" "$key_target" \
+            || die "Could not copy BIKEY '${key_file}' to '${key_target}'."
+
+        copied_count=$((copied_count + 1))
     done < <(
         find "$mod_dir" -type f -iname '*.bikey' -print0 2>/dev/null
     )
+
+    if (( copied_count > 0 )); then
+        log "Copied ${copied_count} BIKEY file(s) from ${mod_dir}."
+    else
+        warn "No BIKEY files found in ${mod_dir}."
+    fi
 }
 
 ensure_workshop_meta() {
@@ -899,6 +932,8 @@ main() {
 
     mkdir -p "${SERVER_ROOT}/keys" "${SERVER_ROOT}/serverprofile"
     cd "$SERVER_ROOT"
+    
+    prepare_keys_directory
 
     client_collection="$(trim "${STEAM_WORKSHOP_COLLECTION_URL:-}")"
     server_collection="$(trim "${STEAM_WORKSHOP_SERVERMODS_COLLECTION_URL:-}")"
