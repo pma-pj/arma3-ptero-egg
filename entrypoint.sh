@@ -338,13 +338,18 @@ prepare_keys_directory() {
 
     is_enabled "$CLEAN_KEYS_ON_START" || return 0
 
+    # WICHTIG:
+    # a3.bikey ist der offizielle Arma-3-Key. Ohne ihn werden sogar Vanilla-
+    # und DLC-Dateien wie dta/bin.pbo, dta/core.pbo oder aow/addons/*.pbo
+    # beim Join abgelehnt.
     find "$keys_dir" \
         -maxdepth 1 \
         -type f \
         -iname '*.bikey' \
+        ! -iname 'a3.bikey' \
         -delete
 
-    log "Cleaned server keys directory."
+    log "Cleaned server keys directory while preserving a3.bikey."
 }
 
 copy_bikeys() {
