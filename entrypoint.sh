@@ -361,86 +361,49 @@ EOF
 normalise_mod_filenames() {
     local mod_dir="$1"
 
-    local pbo_file
-    local pbo_dir
-    local pbo_name
-    local pbo_lower_name
-    local pbo_lower_file
+    local source_file
+    local source_dir
+    local source_name
+    local target_name
+    local target_file
 
     local sig_file
     local sig_dir
     local sig_name
+    local sig_pbo_stem
     local sig_suffix
-    local sig_lower_file
+    local sig_target_name
+    local sig_target_file
+
+    local pbo_file
+    local pbo_dir
+    local pbo_name
+    local matching_sig
 
     local renamed_count=0
+    local missing_signature_count=0
 
     is_enabled "$LOWERCASE_WORKSHOP_FILES" || return 0
 
-    # Zuerst alle .bisign-Dateien passend zu ihren .pbo-Dateien normalisieren.
-    #
-    # Beispiel:
-    #   hlc_wp_ACR.pbo.niarms.bisign
-    # wird:
-    #   hlc_wp_acr.pbo.niarms.bisign
+    # 1) PBO-Dateien lowercase schreiben.
     #
     # Wichtig: Nur der Dateiname wird geändert, nicht der absolute Pfad.
-    while IFS= read -r -d '' pbo_file; do
-        pbo_dir="$(dirname -- "$pbo_file")"
-        pbo_name="$(basename -- "$pbo_file")"
-        pbo_lower_name="${pbo_name,,}"
+    # /home/container/Steam bleibt also /home/container/Steam.
+    while IFS= read -r -d '' source_file; do
+        source_dir="$(dirname -- "$source_file")"
+        source_name="$(basename -- "$source_file")"
+        target_name="${source_name,,}"
+        target_file="${source_dir}/${target_name}"
 
-        # Alle Signaturen suchen, die exakt zu diesem bisherigen PBO-Namen gehören.
-        while IFS= read -r -d '' sig_file; do
-            sig_dir="$(dirname -- "$sig_file")"
-            sig_name="$(basename -- "$sig_file")"
+        [[ "$source_name" == "$target_name" ]] && continue
 
-            # Alles nach "<PBO-Dateiname>." bleibt erhalten.
-            sig_suffix="${sig_name#${pbo_name}.}"
-            sig_lower_file="${sig_dir}/${pbo_lower_name}.${sig_suffix}"
-
-            if [[ "$sig_file" != "$sig_lower_file" ]]; then
-                if [[ -e "$sig_lower_file" ]]; then
-                    rm -f -- "$sig_lower_file" \
-                        || die "Could not remove existing lowercase signature '${sig_lower_file}'."
-                fi
-
-                mv -- "$sig_file" "$sig_lower_file" \
-                    || die "Could not lowercase BISIGN file '${sig_file}'."
-
-                renamed_count=$((renamed_count + 1))
-            fi
-        done < <(
-            find "$pbo_dir" \
-                -maxdepth 1 \
-                -type f \
-                -name "${pbo_name}.*.bisign" \
-                -print0
-        )
-    done < <(
-        LC_ALL=C find "$mod_dir" \
-            -type f \
-            -iname '*.pbo' \
-            -name '*[[:upper:]]*' \
-            -print0
-    )
-
-    # Danach die PBOs selbst klein schreiben.
-    while IFS= read -r -d '' pbo_file; do
-        pbo_dir="$(dirname -- "$pbo_file")"
-        pbo_name="$(basename -- "$pbo_file")"
-        pbo_lower_name="${pbo_name,,}"
-        pbo_lower_file="${pbo_dir}/${pbo_lower_name}"
-
-        [[ "$pbo_name" == "$pbo_lower_name" ]] && continue
-
-        if [[ -e "$pbo_lower_file" ]]; then
-            rm -f -- "$pbo_lower_file" \
-                || die "Could not remove existing lowercase PBO '${pbo_lower_file}'."
+        if [[ -e "$target_file" ]]; then
+            rm -f -- "$target_file" \
+                || die "Could not remove existing lowercase PBO '${target_file}'."
         fi
 
-        mv -- "$pbo_file" "$pbo_lower_file" \
-            || die "Could not lowercase PBO file '${pbo_file}'."
+        mv -- "$source_file" "$target_file" \
+            || die "Could not lowercase PBO file '${source_file}'."
 
         renamed_count=$((renamed_count + 1))
     done < <(
@@ -451,8 +414,80 @@ normalise_mod_filenames() {
             -print0
     )
 
+    # 2) Alle BISIGN-Dateien reparieren, unabhängig davon, ob die PBO schon
+    #    vorher lowercase war.
+    #
+    # Beispiel:
+    #   TKE_Ext_APC.pbo.TKE_Ext_V.bisign
+    # wird:
+    #   tke_ext_apc.pbo.TKE_Ext_V.bisign
+    #
+    # Der Key-Suffix nach ".pbo." bleibt erhalten. Entscheidend ist, dass der
+    # Prefix exakt zum lowercase-PBO-Dateinamen passt.
+    while IFS= read -r -d '' sig_file; do
+        sig_dir="$(dirname -- "$sig_file")"
+        sig_name="$(basename -- "$sig_file")"
+
+        if [[ "$sig_name" =~ ^(.+)\.[pP][bB][oO]\.(.+)$ ]]; then
+            sig_pbo_stem="${BASH_REMATCH[1]}"
+            sig_suffix="${BASH_REMATCH[2]}"
+        else
+            continue
+        fi
+
+        sig_target_name="${sig_pbo_stem,,}.pbo.${sig_suffix}"
+        sig_target_file="${sig_dir}/${sig_target_name}"
+
+        [[ "$sig_name" == "$sig_target_name" ]] && continue
+
+        if [[ -e "$sig_target_file" ]]; then
+            rm -f -- "$sig_target_file" \
+                || die "Could not remove existing normalized BISIGN '${sig_target_file}'."
+        fi
+
+        mv -- "$sig_file" "$sig_target_file" \
+            || die "Could not normalize BISIGN file '${sig_file}'."
+
+        renamed_count=$((renamed_count + 1))
+    done < <(
+        LC_ALL=C find "$mod_dir" \
+            -type f \
+            -iname '*.bisign' \
+            -print0
+    )
+
+    # 3) Diagnose: Nach der Normalisierung prüfen, welche PBOs wirklich noch
+    #    keine passende BISIGN haben.
+    while IFS= read -r -d '' pbo_file; do
+        pbo_dir="$(dirname -- "$pbo_file")"
+        pbo_name="$(basename -- "$pbo_file")"
+
+        matching_sig="$(
+            find "$pbo_dir" \
+                -maxdepth 1 \
+                -type f \
+                -name "${pbo_name}.*.bisign" \
+                -print \
+                -quit
+        )"
+
+        if [[ -z "$matching_sig" ]]; then
+            warn "PBO has no matching BISIGN after normalization: ${pbo_file}"
+            missing_signature_count=$((missing_signature_count + 1))
+        fi
+    done < <(
+        LC_ALL=C find "$mod_dir" \
+            -type f \
+            -iname '*.pbo' \
+            -print0
+    )
+
     if (( renamed_count > 0 )); then
         log "Normalized ${renamed_count} PBO/BISIGN filename(s) in ${mod_dir}."
+    fi
+
+    if (( missing_signature_count > 0 )); then
+        warn "${missing_signature_count} PBO file(s) in ${mod_dir} still have no matching BISIGN."
     fi
 }
 
