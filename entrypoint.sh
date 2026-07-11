@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Custom Arma 3 / Pterodactyl entrypoint.
 #
-# The script deliberately starts Arma directly. It does not delegate to the
-# upstream entrypoint, because the upstream startup command quoting is the
-# remaining source of the mod-loading problem in this deployment.
-#
 # Optional custom variables:
 #   STEAM_WORKSHOP_COLLECTION_URL
 #   STEAM_WORKSHOP_SERVERMODS_COLLECTION_URL
-#   STEAMCMD_BATCH_SIZE            (default 50, hard maximum 50)
-#   WORKSHOP_VALIDATE              (0 default; set 1 only for a full validate)
+#   STEAMCMD_BATCH_SIZE              default 50, hard maximum 50
+#   WORKSHOP_VALIDATE                default 0; set 1 only for a full validate
+#   LOWERCASE_WORKSHOP_FILES         default 1
+#   CLEAN_KEYS_ON_START              default 1
+#   SKIP_UNSIGNED_MODS               default 1
+#   SKIP_MODS_WITH_MISSING_KEYS      default 1
 #
 # Existing egg variables used:
 #   STEAM_USER, STEAM_PASS, SERVER_PORT, SERVER_BINARY, UPDATE_SERVER,
@@ -36,9 +36,11 @@ STEAMCMD_ATTEMPTS="${STEAMCMD_ATTEMPTS:-3}"
 STEAMCMD_RETRY_DELAY="${STEAMCMD_RETRY_DELAY:-5}"
 STEAMCMD_BATCH_SIZE="${STEAMCMD_BATCH_SIZE:-50}"
 WORKSHOP_VALIDATE="${WORKSHOP_VALIDATE:-0}"
+
 LOWERCASE_WORKSHOP_FILES="${LOWERCASE_WORKSHOP_FILES:-1}"
-SKIP_UNSIGNED_MODS="${SKIP_UNSIGNED_MODS:-1}"
 CLEAN_KEYS_ON_START="${CLEAN_KEYS_ON_START:-1}"
+SKIP_UNSIGNED_MODS="${SKIP_UNSIGNED_MODS:-1}"
+SKIP_MODS_WITH_MISSING_KEYS="${SKIP_MODS_WITH_MISSING_KEYS:-1}"
 
 log() {
     printf '[COLLECTION] %s\n' "$*" >&2
@@ -198,7 +200,6 @@ resolve_collection_tree() {
     while IFS=$'\t' read -r child_type child_id; do
         [[ "$child_id" =~ ^[0-9]{5,20}$ ]] || continue
 
-        # Steam filetype 2 denotes a nested Steam Workshop collection.
         if [[ "$child_type" == '2' ]]; then
             log "Resolving nested Steam Workshop collection: ${child_id}"
             resolve_collection_tree "$child_id" "$((depth + 1))"
@@ -359,6 +360,7 @@ copy_bikeys() {
 
     while IFS= read -r -d '' key_file; do
         key_name="$(basename -- "$key_file")"
+        key_name="${key_name,,}"
         key_target="${keys_dir}/${key_name}"
 
         cp -f -- "$key_file" "$key_target" \
@@ -419,10 +421,6 @@ normalise_mod_filenames() {
 
     is_enabled "$LOWERCASE_WORKSHOP_FILES" || return 0
 
-    # 1) PBO-Dateien lowercase schreiben.
-    #
-    # Wichtig: Nur der Dateiname wird geändert, nicht der absolute Pfad.
-    # /home/container/Steam bleibt also /home/container/Steam.
     while IFS= read -r -d '' source_file; do
         source_dir="$(dirname -- "$source_file")"
         source_name="$(basename -- "$source_file")"
@@ -448,16 +446,6 @@ normalise_mod_filenames() {
             -print0
     )
 
-    # 2) Alle BISIGN-Dateien reparieren, unabhängig davon, ob die PBO schon
-    #    vorher lowercase war.
-    #
-    # Beispiel:
-    #   TKE_Ext_APC.pbo.TKE_Ext_V.bisign
-    # wird:
-    #   tke_ext_apc.pbo.TKE_Ext_V.bisign
-    #
-    # Der Key-Suffix nach ".pbo." bleibt erhalten. Entscheidend ist, dass der
-    # Prefix exakt zum lowercase-PBO-Dateinamen passt.
     while IFS= read -r -d '' sig_file; do
         sig_dir="$(dirname -- "$sig_file")"
         sig_name="$(basename -- "$sig_file")"
@@ -490,8 +478,6 @@ normalise_mod_filenames() {
             -print0
     )
 
-    # 3) Diagnose: Nach der Normalisierung prüfen, welche PBOs wirklich noch
-    #    keine passende BISIGN haben.
     while IFS= read -r -d '' pbo_file; do
         pbo_dir="$(dirname -- "$pbo_file")"
         pbo_name="$(basename -- "$pbo_file")"
@@ -652,8 +638,6 @@ download_workshop_item_with_retries() {
             +workshop_download_item "$WORKSHOP_APP_ID" "$item_id"
         )
 
-        # A retry validates incomplete or corrupt content regardless of the
-        # normal WORKSHOP_VALIDATE setting.
         command+=(validate +quit)
 
         if HOME="$SERVER_ROOT" "${command[@]}"; then
@@ -742,7 +726,6 @@ mod_has_required_signatures() {
     local missing_count=0
     local checked_count=0
 
-    # Wenn deaktiviert, wird nichts gefiltert.
     is_enabled "$SKIP_UNSIGNED_MODS" || return 0
 
     if [[ ! -d "$addons_dir" ]]; then
@@ -789,6 +772,69 @@ mod_has_required_signatures() {
     return 0
 }
 
+mod_has_required_bikeys() {
+    local mod_path="$1"
+    local mod_name="$2"
+    local addons_dir="${mod_path}/addons"
+    local keys_dir="${SERVER_ROOT}/keys"
+
+    local sig_file
+    local sig_name
+    local key_name
+    local key_lookup
+    local missing_count=0
+    local checked_count=0
+
+    local -A seen_keys=()
+
+    is_enabled "$SKIP_MODS_WITH_MISSING_KEYS" || return 0
+
+    if [[ ! -d "$addons_dir" ]]; then
+        warn "Skipping BIKEY check for ${mod_name}: addons directory missing."
+        return 1
+    fi
+
+    while IFS= read -r -d '' sig_file; do
+        sig_name="$(basename -- "$sig_file")"
+
+        if [[ "$sig_name" =~ \.[pP][bB][oO]\.(.+)\.[bB][iI][sS][iI][gG][nN]$ ]]; then
+            key_name="${BASH_REMATCH[1]}"
+        else
+            warn "Could not extract key name from BISIGN in ${mod_name}: ${sig_file}"
+            missing_count=$((missing_count + 1))
+            continue
+        fi
+
+        key_lookup="${key_name,,}.bikey"
+
+        [[ -z "${seen_keys[$key_lookup]:-}" ]] || continue
+        seen_keys["$key_lookup"]=1
+        checked_count=$((checked_count + 1))
+
+        if [[ ! -f "${keys_dir}/${key_lookup}" ]]; then
+            warn "Missing BIKEY for ${mod_name}: ${key_lookup} required by ${sig_file}"
+            missing_count=$((missing_count + 1))
+        fi
+    done < <(
+        LC_ALL=C find "$addons_dir" \
+            -type f \
+            -iname '*.bisign' \
+            -print0
+    )
+
+    if (( checked_count == 0 )); then
+        warn "No BIKEY references found in ${mod_name}; no BISIGN files were present."
+        return 0
+    fi
+
+    if (( missing_count > 0 )); then
+        warn "Skipping mod ${mod_name}: ${missing_count} required BIKEY reference(s) are missing."
+        return 1
+    fi
+
+    return 0
+}
+
 build_mod_paths() {
     local source_variable="$1"
     local target_array_name="$2"
@@ -804,19 +850,16 @@ build_mod_paths() {
     local full_path
     local arma_entry
 
-    # Bash nameref auf das Ziel-Array, z. B. client_mod_paths.
     local -n target_array="$target_array_name"
 
     target_array=()
 
-    # Semikolon-getrennte Egg-Variable in einzelne Mod-Einträge zerlegen.
     IFS=';' read -r -a entries <<<"${current_value%;}"
 
     for entry in "${entries[@]}"; do
         entry="$(trim "$entry")"
         [[ -n "$entry" ]] || continue
 
-        # Für die Dateisystem-Prüfung immer einen absoluten Pfad verwenden.
         if [[ "$entry" == /* ]]; then
             full_path="$entry"
         else
@@ -833,31 +876,23 @@ build_mod_paths() {
             continue
         fi
 
-        # Doppelte Einträge verhindern. Die Prüfung erfolgt über den absoluten
-        # Pfad, damit @123 und /home/container/@123 nicht doppelt auftauchen.
         [[ -z "${seen_paths[$full_path]:-}" ]] || continue
         seen_paths["$full_path"]=1
 
-        # Wichtig:
-        # Für Mods innerhalb des Server-Roots übergeben wir Arma wieder den
-        # relativen Namen, z. B. @3020755032, statt /home/container/@3020755032.
-        #
-        # Manuell angegebene absolute Pfade außerhalb des Server-Roots bleiben
-        # bewusst absolute Pfade.
         if [[ "$full_path" == "${SERVER_ROOT}/"* ]]; then
             arma_entry="${full_path#"${SERVER_ROOT}/"}"
         else
             arma_entry="$full_path"
         fi
 
-        # Optionaler Schutz:
-        # Wenn ein Mod mindestens eine .pbo ohne passende .bisign enthält,
-        # wird der komplette Mod nicht an -mod/-serverMod übergeben.
         if ! mod_has_required_signatures "$full_path" "$arma_entry"; then
             continue
         fi
 
-        # CBA zuerst laden, weil es eine Abhängigkeit vieler anderer Mods ist.
+        if ! mod_has_required_bikeys "$full_path" "$arma_entry"; then
+            continue
+        fi
+
         if [[ "$arma_entry" == "@450814997" ]]; then
             cba_entries+=("$arma_entry")
         else
@@ -894,9 +929,6 @@ parse_startup_parameters() {
 
     target_array=()
 
-    # The official egg treats this whole field as one quoted argument. Here it
-    # is intentionally split into individual CLI arguments, so
-    # "-noLogs -autoInit" becomes two parameters.
     read -r -a target_array <<<"$raw_parameters"
 }
 
@@ -917,8 +949,6 @@ prepare_arma_runtime() {
     USER_ID="$(id -u)"
     GROUP_ID="$(id -g)"
 
-    # Das Basis-Image setzt diese Variablen sowie /passwd.template bereit.
-    # Ohne NSS-Wrapper kann Arma im Container beim Start segfaulten.
     if [[ -n "${NSS_WRAPPER_PASSWD:-}" ]] \
         && [[ -n "${NSS_WRAPPER_GROUP:-}" ]] \
         && [[ -f "/passwd.template" ]] \
@@ -1000,7 +1030,7 @@ main() {
 
     mkdir -p "${SERVER_ROOT}/keys" "${SERVER_ROOT}/serverprofile"
     cd "$SERVER_ROOT"
-    
+
     prepare_keys_directory
 
     client_collection="$(trim "${STEAM_WORKSHOP_COLLECTION_URL:-}")"
